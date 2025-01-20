@@ -5,9 +5,9 @@ from .epub_parser import parse_epub_generic
 from dotenv import load_dotenv
 from ebooklib import epub
 from bs4 import BeautifulSoup
-
+from enums.books import BOOKS_FR, BOOKS_EN, END_BOOKS, START_BOOKS
 load_dotenv()
-
+ALL_BOOKS = BOOKS_FR + BOOKS_EN
 
 def flatten_epub(epub_path, output_path=None):
     """
@@ -72,7 +72,7 @@ def clean_text(file_path):
     #    - On veut conserver le \n si le caractère suivant est un digit (ex. 12),
     #      et supprimer tous les \n sinon.
     #
-    #    Explication de la regex : 
+    #    Explication de la regex :
     #      \n+(?!\d)
     #      - \n+ : une ou plusieurs fins de ligne
     #      - (?!\d) : si le prochain caractère n'est PAS un chiffre
@@ -88,23 +88,105 @@ def clean_text(file_path):
     print("  - [chiffres] supprimés")
     print("  - Retours à la ligne supprimés sauf devant un chiffre.")
 
+
+def detect_book_chapter_in_line(line, books_list):
+    """
+    Extrait (book, chapter) s'il existe ex. "Deutéronome 1" n'importe où dans la ligne.
+    Return (None, None) si pas trouvé.
+    """
+    for book in books_list:
+        # On autorise 0 espace => \s*
+        # Ex.  "Jericho.Deutéronome 1"
+        pattern = rf"{re.escape(book)}\s*(\d+)"
+        found = re.search(pattern, line)
+        if found:
+            chap_str = found.group(1)
+            try:
+                chap_num = int(chap_str)
+            except ValueError:
+                continue
+            return (book, chap_num)
+    return (None, None)
+
+
 def parse_bible(epub_path, book_id):
-    db_path = os.environ["DATABASE_FILE"]
     """
-    Parse un EPUB de type 'Bible' et insère le texte verset par verset dans la DB.
-    - epub_path: chemin vers l'EPUB
-    - db_path: chemin vers la base SQLite
-    - book_id: ID de la table 'books' correspondant à ce livre
+    1) Flatten => un fichier .txt
+    2) Nettoyer => retire [n], etc.
+    3) Parcourt le fichier.
+       - Ignore tout avant Genèse 1:1 (ou Genesis 1:1).
+       - Stocke (livre, chapitre, verset, texte).
+       - S'arrête après Apocalypse 22:21 (ou Revelation 22:21).
     """
-    # 1. Extraire le contenu brut
-    result = parse_epub_generic(epub_path)
-    metadata = result["metadata"]
 
     flatten_epub_path = flatten_epub(epub_path)
     clean_text(flatten_epub_path)
-    # 2. Connexion DB
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    conn.commit()
-    conn.close()
-    print(f"[INFO] Bible parsed and inserted into DB. Book ID: {book_id}")
+
+    verses = []
+    current_book = None
+    current_chapter = None
+
+    # Flags pour savoir si on a commencé / fini
+    has_started = False
+    has_finished = False
+
+    with open(flatten_epub_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 1) Détecter s'il y a un "Livre Chapitre"
+            b, c = detect_book_chapter_in_line(line, ALL_BOOKS)
+            if b and c:
+                current_book = b
+                current_chapter = c
+                # On continue la boucle pour vérifier si la ligne contient AUSSI un verset
+                # => si c'est rare, on peut ignorer. Si c'est fréquent, on peut re-check
+                #   la même line, mais passons.
+
+            # 2) Détecter verset => ^(\d+)(.*)
+            match_verse = re.match(r'^(\d+)(.*)', line)
+            if match_verse:
+                verse_num_str = match_verse.group(1)
+                verse_text = match_verse.group(2).strip()
+                try:
+                    verse_num = int(verse_num_str)
+                except ValueError:
+                    verse_num = None
+
+                if current_book and current_chapter and verse_num is not None:
+                    # ----- Vérifier si on doit "start" -----
+                    # On démarre la collecte dès qu'on voit (Genèse/Genesis, 1, 1)
+                    if not has_started:
+                        if (current_book in START_BOOKS) and (current_chapter == 1) and (verse_num == 1):
+                            has_started = True
+                        else:
+                            # Pas encore commencé
+                            continue
+
+                    # ----- Vérifier si on doit "stop" -----
+                    # On arrête si on voit (Apocalypse/Revelation, 22, 21)
+                    if has_started and not has_finished:
+                        if (current_book in END_BOOKS) and (current_chapter == 22) and (verse_num == 21):
+                            # On ajoute ce dernier verset, puis on arrête
+                            verses.append((current_book, current_chapter, verse_num, verse_text))
+                            has_finished = True
+                            break  # sortir du for
+
+                    # Si on est "en cours"
+                    if has_started and not has_finished:
+                        verses.append((current_book, current_chapter, verse_num, verse_text))
+
+            # fin du for line
+
+    # Debug ou usage
+    print("[INFO] Nombre de versets extraits :", len(verses))
+    if verses:
+        print("Premier verset:", verses[0])
+        print("Dernier verset:", verses[-1])
+
+    return verses
+
+
+
